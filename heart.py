@@ -1,245 +1,277 @@
 #!/usr/bin/env python3
 """
-3D ASCII Heart Animation
-Renders a pulsating, rotating 3D heart using implicit surface equation.
-Uses ANSI escape codes for terminal control, z-buffer for depth sorting,
-and depth-based ASCII shading.
+3D ASCII Heart — Demoscene-style terminal animation.
+
+Renders the implicit heart surface:
+    f(x,y,z) = (x^2 + 9/4*y^2 + z^2 - 1)^3 - x^2*z^3 - 9/80*y^2*z^3 = 0
+
+Strategy (inspired by a][ donut):
+  - Pre-compute a dense point cloud on the surface by scanning a 3D grid
+    and keeping every voxel near f=0.
+  - Each frame: rotate all points, perspective-project, z-buffer, shade
+    using the analytic gradient for Lambertian lighting.
+
+Controls: Ctrl-C to quit.
 """
 
 import math
-import os
 import sys
 import time
+import shutil
 
-# ASCII shading characters from dark to bright
-SHADES = " .:-=+*#%@"
+# ── Shading ramp (space = background, rightward = brighter) ─────────────────
+SHADE_CHARS = " .,:;!*+?S#%@"
+N_SHADES = len(SHADE_CHARS)
 
-# Heart surface equation: (x² + (9/4)y² + z² - 1)³ - x²z³ - (9/80)y²z³ = 0
-def heart_equation(x, y, z):
-    """
-    Evaluate the implicit 3D heart equation.
-    Returns value close to 0 when point is on surface.
-    """
-    a = x * x + (9.0 / 4.0) * y * y + z * z - 1.0
-    return a * a * a - x * x * z * z * z - (9.0 / 80.0) * y * y * z * z * z
+# ── Implicit heart equation ─────────────────────────────────────────────────
+# f(x,y,z) = (x² + 9/4·y² + z² − 1)³ − x²·z³ − 9/80·y²·z³
 
-def sample_heart_surface(num_theta=100, num_phi=80):
-    """
-    Sample points on heart surface using parametric approximation.
-    Uses spherical parameterization adjusted to match implicit equation.
-    """
-    points = []
-    
-    for i in range(num_theta):
-        theta = 2.0 * math.pi * i / num_theta
-        for j in range(num_phi):
-            phi = math.pi * j / num_phi
-            
-            # Base spherical coordinates
-            x = math.sin(phi) * math.cos(theta)
-            y = math.sin(phi) * math.sin(theta)
-            z = math.cos(phi)
-            
-            # Transform sphere into heart shape
-            # Flatten top to create atrial separation
-            if z > 0.3:
-                # Create cleft between atria
-                cleft = abs(math.sin(theta))
-                if cleft < 0.3:
-                    z -= 0.4 * (0.3 - cleft)
-                z *= 0.85
-            
-            # Elongate bottom (ventricles)
-            if z < 0:
-                z *= 1.3
-            
-            # Flatten sides
-            r_xy = math.sqrt(x * x + y * y)
-            if r_xy > 0:
-                flatten = 0.9 + 0.1 * abs(y) / r_xy
-                x *= flatten
-                y *= flatten * 0.67  # y scaling from equation (9/4 factor)
-            
-            # Verify point is on implicit surface
-            if abs(heart_equation(x, y, z)) < 0.5:
-                points.append((x, y, z))
-    
-    return points
+def heart_f(x, y, z):
+    """Evaluate the heart equation. Returns 0 on the surface."""
+    a = x*x + 2.25*y*y + z*z - 1.0
+    z3 = z*z*z
+    return a*a*a - x*x*z3 - 0.1125*y*y*z3
 
-def rotate_3d(x, y, z, angle_x, angle_y, angle_z=0):
-    """
-    Rotate point around X, Y, and Z axes using rotation matrices.
-    Order: Z -> Y -> X rotation (intrinsic rotations).
-    """
-    # Rotate around Z axis
-    cos_z, sin_z = math.cos(angle_z), math.sin(angle_z)
-    x1 = x * cos_z - y * sin_z
-    y1 = x * sin_z + y * cos_z
-    x, y = x1, y1
-    
-    # Rotate around Y axis
-    cos_y, sin_y = math.cos(angle_y), math.sin(angle_y)
-    x1 = x * cos_y + z * sin_y
-    z1 = -x * sin_y + z * cos_y
-    x, z = x1, z1
-    
-    # Rotate around X axis
-    cos_x, sin_x = math.cos(angle_x), math.sin(angle_x)
-    y1 = y * cos_x - z * sin_x
-    z1 = y * sin_x + z * cos_x
-    y, z = y1, z1
-    
-    return x, y, z
+def heart_grad(x, y, z):
+    """Analytic gradient of f — used as the surface normal.
 
-def project_3d_to_2d(x, y, z, width, height, fov=80):
+    a  = x² + 9/4·y² + z² − 1
+    df/dx = 6a²·x   − 2x·z³
+    df/dy = 13.5a²·y − 0.225y·z³
+    df/dz = 6a²·z    − 3x²z²  − 0.3375y²z²
     """
-    Perspective projection from 3D to 2D screen coordinates.
-    FOV controls the field of view (larger = more zoomed out).
-    Returns (screen_x, screen_y, depth) or (-1, -1, -999) if behind camera.
+    a  = x*x + 2.25*y*y + z*z - 1.0
+    a2 = a*a
+    z2 = z*z
+    z3 = z2*z
+    return (6.0*a2*x   - 2.0*x*z3,
+            13.5*a2*y  - 0.225*y*z3,
+            6.0*a2*z   - 3.0*x*x*z2 - 0.3375*y*y*z2)
+
+# ── Surface sampling via 3D voxel grid ──────────────────────────────────────
+# Scan a bounding box, keep points where |f| < threshold. This is brute-force
+# but guarantees full coverage of the heart surface including all lobes.
+
+def sample_surface(res=90, threshold=0.02):
+    """Return parallel arrays (px, py, pz, nx, ny, nz) of surface points.
+
+    res      — grid divisions per axis (higher = denser, slower startup)
+    threshold — isosurface thickness |f| < threshold
     """
-    # Camera distance
-    distance = 50
-    
-    # Perspective divide
-    if z + distance > 0:
-        factor = fov / (z + distance)
-        screen_x = width / 2 + x * factor * 2.0  # x2 for aspect ratio
-        screen_y = height / 2 - y * factor
-        return int(screen_x), int(screen_y), z
-    return -1, -1, -999
+    # Bounding box for the heart (empirically determined)
+    lo, hi = -1.5, 1.5
 
-def get_terminal_size():
-    """Get terminal dimensions using stty or environment variables."""
-    try:
-        # Try using shutil (Python 3.3+)
-        import shutil
-        size = shutil.get_terminal_size()
-        return size.columns, size.lines
-    except:
-        # Fallback to environment variables
-        return int(os.environ.get('COLUMNS', 80)), int(os.environ.get('LINES', 24))
+    step = (hi - lo) / res
+    pts_x, pts_y, pts_z = [], [], []
+    nrm_x, nrm_y, nrm_z = [], [], []
 
-def render_frame(points, width, height, rot_x, rot_y, rot_z, scale):
-    """
-    Render a single frame with z-buffer and depth shading.
-    Returns buffer as list of strings (one per row).
-    """
-    # Initialize empty buffer and z-buffer
-    buffer = [[' ' for _ in range(width)] for _ in range(height)]
-    z_buffer = [[-float('inf') for _ in range(width)] for _ in range(height)]
-    
-    for x, y, z in points:
-        # Apply pulsation scale
-        x *= scale
-        y *= scale
-        z *= scale
-        
-        # Apply 3D rotation
-        xr, yr, zr = rotate_3d(x, y, z, rot_x, rot_y, rot_z)
-        
-        # Project to 2D
-        px, py, depth = project_3d_to_2d(xr, yr, zr, width, height)
-        
-        if px < 0:
-            continue
-        
-        # Check bounds
-        if 0 <= px < width and 0 <= py < height:
-            # Z-buffer: only draw if this point is closer
-            if depth > z_buffer[py][px]:
-                z_buffer[py][px] = depth
-                
-                # Depth-based shading (normalized to shade range)
-                # Map depth from [-25, 25] to [0, len(SHADES)-1]
-                shade_idx = int((depth + 25) / 50 * (len(SHADES) - 1))
-                shade_idx = max(0, min(len(SHADES) - 1, shade_idx))
-                buffer[py][px] = SHADES[shade_idx]
-    
-    return [''.join(row) for row in buffer]
+    for ix in range(res + 1):
+        x = lo + ix * step
+        for iy in range(res + 1):
+            y = lo + iy * step
+            for iz in range(res + 1):
+                z = lo + iz * step
 
-def clear_screen():
-    """Clear terminal using ANSI escape codes (no flicker)."""
-    # \033[2J = clear entire screen
-    # \033[H = move cursor to home position (0,0)
-    sys.stdout.write('\033[2J\033[H')
-    sys.stdout.flush()
+                val = heart_f(x, y, z)
+                if abs(val) < threshold:
+                    # Compute surface normal from gradient
+                    gx, gy, gz = heart_grad(x, y, z)
+                    gl = math.sqrt(gx*gx + gy*gy + gz*gz)
+                    if gl > 1e-10:
+                        gx /= gl; gy /= gl; gz /= gl
+                    else:
+                        continue   # degenerate point, skip
 
-def hide_cursor():
-    """Hide terminal cursor for cleaner animation."""
-    sys.stdout.write('\033[?25l')
-    sys.stdout.flush()
+                    pts_x.append(x)
+                    pts_y.append(y)
+                    pts_z.append(z)
+                    nrm_x.append(gx)
+                    nrm_y.append(gy)
+                    nrm_z.append(gz)
 
-def show_cursor():
-    """Show terminal cursor."""
-    sys.stdout.write('\033[?25h')
-    sys.stdout.flush()
+    return pts_x, pts_y, pts_z, nrm_x, nrm_y, nrm_z
+
+# ── Main animation loop ────────────────────────────────────────────────────
 
 def main():
-    """Main animation loop."""
-    # Sample heart surface once (reusable points)
-    print("Sampling heart surface...")
-    points = sample_heart_surface(num_theta=120, num_phi=90)
-    print(f"Generated {len(points)} surface points")
-    time.sleep(0.5)
-    
-    # Setup terminal
-    hide_cursor()
-    clear_screen()
-    
+    # -- Sample surface once --------------------------------------------------
+    sys.stdout.write("\x1b[2J\x1b[HSampling heart surface...")
+    sys.stdout.flush()
+
+    # res=90 gives ~20-30k points — good density for a full-screen render
+    px, py, pz, nx_, ny_, nz_ = sample_surface(res=90, threshold=0.018)
+    N = len(px)
+
+    sys.stdout.write(f"\r{N} surface points sampled.     \n")
+    sys.stdout.flush()
+    time.sleep(0.3)
+
+    # -- Light direction (normalised) — front upper-right --------------------
+    Lx, Ly, Lz = 0.6, 0.6, -0.8
+    Ll = math.sqrt(Lx*Lx + Ly*Ly + Lz*Lz)
+    Lx /= Ll; Ly /= Ll; Lz /= Ll
+
+    # -- ANSI codes -----------------------------------------------------------
+    HOME  = "\x1b[H"       # cursor to (0, 0)
+    HIDE  = "\x1b[?25l"    # hide cursor
+    SHOW  = "\x1b[?25h"    # show cursor
+    CLEAR = "\x1b[2J"      # clear screen
+
+    sys.stdout.write(HIDE + CLEAR)
+    sys.stdout.flush()
+
+    frame = 0
+    t0 = time.monotonic()
+
     try:
-        frame_count = 0
-        start_time = time.time()
-        
         while True:
-            frame_start = time.time()
-            
-            # Get current terminal size
-            width, height = get_terminal_size()
-            # Leave room for stats line
-            height = max(5, height - 1)
-            width = max(20, width)
-            
-            # Animation parameters based on time
-            t = frame_count * 0.05
-            
-            # Pulsation: sinusoidal scale factor (heartbeat effect)
-            # Two-phase pulsation for realistic heartbeat
-            pulse = math.sin(t * 2) * 0.5 + 0.5  # 0 to 1
-            scale = 16.0 + 3.0 * pulse
-            
-            # Continuous rotation around multiple axes
-            rot_x = t * 0.3  # Rotate around X
-            rot_y = t * 0.5  # Rotate around Y (faster)
-            rot_z = t * 0.1  # Slow Z rotation for extra 3D effect
-            
-            # Render frame
-            frame = render_frame(points, width, height, rot_x, rot_y, rot_z, scale)
-            
-            # Calculate FPS
-            elapsed = time.time() - start_time
-            fps = frame_count / elapsed if elapsed > 0 else 0
-            
-            # Draw frame
-            clear_screen()
-            sys.stdout.write('\n'.join(frame))
-            sys.stdout.write(f"\n\nPoints: {len(points)} | FPS: {fps:.1f} | Scale: {scale:.1f}")
+            tf = time.monotonic()
+
+            # -- Terminal size ------------------------------------------------
+            cols, rows = shutil.get_terminal_size()
+            rows = max(6, rows - 2)    # leave room for status bar
+            cols = max(20, cols)
+
+            # -- Time ---------------------------------------------------------
+            t = frame * 0.03
+
+            # -- Pulsation (heartbeat) ----------------------------------------
+            # Asymmetric: fast systole (contraction), slower diastole (relax)
+            beat_phase = (t * 2.0) % (2.0 * math.pi)
+            pulse = math.sin(beat_phase)
+            pulse = pulse * abs(pulse)            # sharpen the beat
+            scale_factor = 1.0 + 0.08 * pulse    # ±8 % size change
+
+            # -- Scale to fit terminal ----------------------------------------
+            # Heart spans ~3 units (from -1.5 to 1.5). We want it to fill
+            # roughly 70% of the smaller screen dimension.
+            #
+            # Projection: sx = cols/2 + K1 * x2 * ooz * aspect
+            # At model centre ooz ≈ 1/K2, so:
+            #   K1 * 1.5 / K2 * aspect  should ≈ cols * 0.35
+            #   K1 * 1.5 / K2           should ≈ rows * 0.35
+            #
+            # Solving for K1 with the K2 factor included:
+            K2 = 5.0
+            aspect = 2.0
+
+            desired_half_x = cols * 0.38   # how many chars from centre to edge
+            desired_half_y = rows * 0.38
+
+            need_K1_x = desired_half_x * K2 / (1.5 * aspect)
+            need_K1_y = desired_half_y * K2 / 1.5
+
+            K1 = min(need_K1_x, need_K1_y) * scale_factor
+
+            # -- Rotation angles ----------------------------------------------
+            # A = slow rock around X,  B = continuous spin around Y
+            A = math.sin(t * 0.15) * 0.35        # gentle nod ±20°
+            B = t * 0.45                          # ~26°/s Y spin
+
+            sinA, cosA = math.sin(A), math.cos(A)
+            sinB, cosB = math.sin(B), math.cos(B)
+
+            # -- Clear buffers ------------------------------------------------
+            sz = cols * rows
+            output = bytearray(b' ' * sz)         # char buffer (bytes)
+            zbuf   = [-1e9] * sz                   # depth buffer
+
+            # -- Project each point -------------------------------------------
+            for i in range(N):
+                # Original point — remap so heart stands upright:
+                #   Heart eq z-axis has lobes (z>0) and tip (z<0).
+                #   We want z → screen-Y (up), x → screen-X, y → depth.
+                x0 = px[i]          # model x → screen x
+                y0 = -pz[i]         # model z → screen y (negate: z>0 lobes = screen up)
+                z0 = py[i]          # model y → depth
+
+                # --- Rotate around X axis (angle A) — gentle nod ---
+                y1 = y0 * cosA - z0 * sinA
+                z1 = y0 * sinA + z0 * cosA
+
+                # --- Rotate around Y axis (angle B) — continuous spin ---
+                x2 = x0 * cosB + z1 * sinB
+                z2 = -x0 * sinB + z1 * cosB
+
+                # --- Perspective projection ---
+                ooz = 1.0 / (z2 + K2)
+
+                # Screen coordinates (centred)
+                sx = int(cols  * 0.5 + K1 * x2 * ooz * aspect)
+                sy = int(rows * 0.5 + K1 * y1 * ooz)
+
+                if not (0 <= sx < cols and 0 <= sy < rows):
+                    continue
+
+                idx = sy * cols + sx
+
+                # Z-buffer: closer points have smaller z2 (camera at −K2)
+                # We want to draw the point closest to the camera, i.e. with
+                # the smallest z2, so store as −z2 and keep the maximum.
+                depth = -z2
+                if depth <= zbuf[idx]:
+                    continue
+                zbuf[idx] = depth
+
+                # --- Rotate normal (same remapping + rotations) ---
+                nnx = nx_[i]
+                nny = -nz_[i]       # same remap as positions
+                nnz = ny_[i]
+
+                nny1 = nny * cosA - nnz * sinA
+                nnz1 = nny * sinA + nnz * cosA
+
+                nnx2 = nnx * cosB + nnz1 * sinB
+                nnz2 = -nnx * sinB + nnz1 * cosB
+
+                # --- Lambertian shading ---
+                # dot(normal, light). The normal should point outward
+                # (toward the camera). If it points away, flip it.
+                dot = nnx2 * Lx + nny1 * Ly + nnz2 * Lz
+
+                # If normal's z-component points toward camera (−Z),
+                # that's "outward". If it points +Z, it's inward → flip.
+                if nnz2 > 0:
+                    dot = -dot
+
+                # Map luminance [0, 1] → shade index
+                # Ambient term (0.15) keeps the dark side visible
+                lum = max(0.0, dot) * 0.85 + 0.15
+                lum = max(0.0, min(1.0, lum))
+                si = int(lum * (N_SHADES - 1) + 0.5)
+                si = max(0, min(N_SHADES - 1, si))
+
+                output[idx] = ord(SHADE_CHARS[si])
+
+            # -- Assemble output string ---------------------------------------
+            lines = []
+            for r in range(rows):
+                s = r * cols
+                lines.append(output[s:s + cols].decode('ascii'))
+
+            elapsed = time.monotonic() - t0
+            fps = (frame / elapsed) if elapsed > 0.01 else 0
+            status = f" {N} pts | {fps:.0f} fps | Ctrl-C quit"
+            lines.append(status.ljust(cols))
+
+            # Write entire frame in one syscall → no flicker
+            sys.stdout.write(HOME + '\n'.join(lines))
             sys.stdout.flush()
-            
-            # Frame rate limiting (~30 FPS = 33ms per frame)
-            frame_time = time.time() - frame_start
-            sleep_time = max(0, 0.033 - frame_time)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            
-            frame_count += 1
-            
+
+            # -- Frame-rate cap (~30 fps) -------------------------------------
+            dt = time.monotonic() - tf
+            rem = 0.033 - dt
+            if rem > 0:
+                time.sleep(rem)
+
+            frame += 1
+
     except KeyboardInterrupt:
         pass
     finally:
-        # Cleanup
-        show_cursor()
-        clear_screen()
-        print("3D ASCII Heart - Goodbye!")
+        sys.stdout.write(SHOW + CLEAR + HOME + "Goodbye!\n")
+        sys.stdout.flush()
+
 
 if __name__ == "__main__":
     main()
